@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -19,6 +20,7 @@ import (
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -28,6 +30,10 @@ import (
 type Client struct {
 	clientset  kubernetes.Interface
 	restConfig *rest.Config
+	// namespaceLabels are extra labels that EnsureNamespace sets on every
+	// stack namespace, in addition to managed-by=k8s-stack-manager
+	// (NAMESPACE_LABELS). Set once before the client is shared.
+	namespaceLabels map[string]string
 }
 
 // NewClient creates a Kubernetes client.
@@ -81,26 +87,70 @@ func (c *Client) RESTConfig() *rest.Config {
 	return c.restConfig
 }
 
+// SetNamespaceLabels sets the extra labels that EnsureNamespace puts on every
+// stack namespace (NAMESPACE_LABELS). The managed-by and instance-name keys
+// are ignored: the client always sets these itself. Call it before the client
+// is shared between goroutines.
+func (c *Client) SetNamespaceLabels(labels map[string]string) {
+	if len(labels) == 0 {
+		c.namespaceLabels = nil
+		return
+	}
+	c.namespaceLabels = make(map[string]string, len(labels))
+	for k, v := range labels {
+		if k == ManagedByLabelKey || k == InstanceNameLabelKey {
+			continue
+		}
+		c.namespaceLabels[k] = v
+	}
+}
+
+// desiredNamespaceLabels returns the labels a stack namespace must have: the
+// extra labels, managed-by=k8s-stack-manager and, when the instance name is a
+// valid label value, k8s-stack-manager.io/instance-name=<instance name>. An
+// instance name that is not a valid label value (names from before the
+// RFC 1123 rule) gives a warning and no instance-name label. An empty
+// instance name gives no instance-name label.
+func (c *Client) desiredNamespaceLabels(namespace, instanceName string) map[string]string {
+	labels := make(map[string]string, len(c.namespaceLabels)+2)
+	for k, v := range c.namespaceLabels {
+		labels[k] = v
+	}
+	labels[ManagedByLabelKey] = ManagedByLabelValue
+	if instanceName != "" {
+		if errs := validation.IsValidLabelValue(instanceName); len(errs) == 0 {
+			labels[InstanceNameLabelKey] = instanceName
+		} else {
+			slog.Warn("Instance name is not a valid label value; namespace gets no instance-name label",
+				"namespace", namespace, "instance_name", instanceName, "label", InstanceNameLabelKey)
+		}
+	}
+	return labels
+}
+
 // EnsureNamespace creates a namespace if it doesn't exist, and makes sure the
-// namespace has the label managed-by=k8s-stack-manager. A namespace that
-// already exists without the label (for example one that `helm install
-// --create-namespace` created) gets the label added. Other tools select stack
-// namespaces by this label, so it must be present on every stack namespace.
-func (c *Client) EnsureNamespace(ctx context.Context, name string) error {
+// namespace has the label managed-by=k8s-stack-manager, the label
+// k8s-stack-manager.io/instance-name=<instanceName> (only when instanceName is
+// a valid label value; see desiredNamespaceLabels) and the extra labels of
+// SetNamespaceLabels. A namespace that already exists without these labels
+// (for example one that `helm install --create-namespace` created) gets them
+// added; a label with a different value gets the configured value. Other
+// labels stay. Other tools select stack namespaces by the managed-by label,
+// so it must be present on every stack namespace.
+func (c *Client) EnsureNamespace(ctx context.Context, name, instanceName string) error {
+	desired := c.desiredNamespaceLabels(name, instanceName)
 	existing, err := c.clientset.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
 	switch {
 	case err == nil:
-		return c.ensureManagedByLabel(ctx, existing)
+		return c.ensureNamespaceLabels(ctx, existing, desired)
 	case !k8serrors.IsNotFound(err):
 		return fmt.Errorf("check namespace %q: %w", name, err)
 	}
 
 	ns := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				"managed-by": "k8s-stack-manager",
-			},
+			Name:   name,
+			Labels: desired,
 		},
 	}
 
@@ -114,7 +164,7 @@ func (c *Client) EnsureNamespace(ctx context.Context, name string) error {
 			if getErr != nil {
 				return fmt.Errorf("get namespace %q: %w", name, getErr)
 			}
-			return c.ensureManagedByLabel(ctx, existing)
+			return c.ensureNamespaceLabels(ctx, existing, desired)
 		}
 		return fmt.Errorf("create namespace %q: %w", name, err)
 	}
@@ -123,18 +173,35 @@ func (c *Client) EnsureNamespace(ctx context.Context, name string) error {
 	return nil
 }
 
-// ensureManagedByLabel adds managed-by=k8s-stack-manager to an existing
-// namespace when the label is missing. It never changes other labels.
-func (c *Client) ensureManagedByLabel(ctx context.Context, ns *corev1.Namespace) error {
-	if ns.Labels["managed-by"] == "k8s-stack-manager" {
+// ensureNamespaceLabels sets the missing or different labels of desired on an
+// existing namespace with one merge patch. It never changes or removes other
+// labels.
+func (c *Client) ensureNamespaceLabels(ctx context.Context, ns *corev1.Namespace, desired map[string]string) error {
+	changed := make(map[string]string)
+	for k, v := range desired {
+		if cur, ok := ns.Labels[k]; !ok || cur != v {
+			changed[k] = v
+		}
+	}
+	if len(changed) == 0 {
 		slog.Debug("Namespace already exists", "namespace", ns.Name)
 		return nil
 	}
-	patch := []byte(`{"metadata":{"labels":{"managed-by":"k8s-stack-manager"}}}`)
+	patch, err := json.Marshal(map[string]any{
+		"metadata": map[string]any{"labels": changed},
+	})
+	if err != nil {
+		return fmt.Errorf("build label patch for namespace %q: %w", ns.Name, err)
+	}
 	if _, err := c.clientset.CoreV1().Namespaces().Patch(ctx, ns.Name, types.MergePatchType, patch, metav1.PatchOptions{}); err != nil {
 		return fmt.Errorf("label namespace %q: %w", ns.Name, err)
 	}
-	slog.Info("Namespace labelled", "namespace", ns.Name, "label", "managed-by=k8s-stack-manager")
+	keys := make([]string, 0, len(changed))
+	for k := range changed {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	slog.Info("Namespace labelled", "namespace", ns.Name, "labels", keys)
 	return nil
 }
 
@@ -184,6 +251,11 @@ const (
 	ManagedByLabelKey   = "managed-by"
 	ManagedByLabelValue = "k8s-stack-manager"
 )
+
+// InstanceNameLabelKey is the namespace label with the stack instance name.
+// Admission policies use it to match a namespace to the exact stack name (a
+// namespace name prefix is ambiguous).
+const InstanceNameLabelKey = "k8s-stack-manager.io/instance-name"
 
 // GetNamespaceManaged reports whether a namespace exists and whether it has
 // the label managed-by=k8s-stack-manager.

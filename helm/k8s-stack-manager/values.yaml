@@ -182,6 +182,18 @@ backend:
   #   pod-security.kubernetes.io/warn: restricted
   namespaceLabels: {}
 
+  # Chart repositories that definitions and templates may use
+  # (ALLOWED_CHART_REPOS). Each entry is a URL prefix with a scheme and a host
+  # (oci, https or http). A chart must be in one of them: the backend checks
+  # chart configs when they are saved and again at deploy time. A chart path
+  # alone (local path, repo alias) is rejected when the list is set. Empty =
+  # every chart source is allowed. Set it on every cluster that untrusted
+  # users can deploy to: Helm runs with the backend service account.
+  # Example:
+  # allowedChartRepos:
+  #   - oci://registry.example.com/charts
+  allowedChartRepos: []
+
   # Extra environment variables, volumes and volume mounts for the backend
   # container (plain Kubernetes syntax). Example: give Helm a registry login
   # file (docker config.json format) for OCI chart repositories that need
@@ -253,6 +265,34 @@ backend:
   serviceAccount:
     create: true
     annotations: {}
+
+  # RBAC of the backend service account on the cluster where it runs (a
+  # cluster registered with use_in_cluster). Helm installs the stack charts
+  # with this identity. Used only when serviceAccount.create is true.
+  rbac:
+    # namespace (default): the backend has rights on namespaced objects only
+    # in stack namespaces, through a RoleBinding (k8s-stack-manager-access)
+    # to the ClusterRole <fullname>-stack-access that it creates in each
+    # stack namespace. Cluster-wide it keeps: nodes (read), namespaces
+    # (manage), pods (read, for the cluster overview), RoleBinding writes and
+    # `bind` on the stack-access ClusterRole and on the ClusterRoles of
+    # backend.namespaceRoleBindings. A chart can then not read or change
+    # objects in other namespaces, and cannot create cluster-scoped objects
+    # (ClusterRoles, CRDs, webhooks). The leader adds the RoleBinding to
+    # stack namespaces that existed before (once per term, then every 10
+    # minutes).
+    # cluster: the rules of chart 0.6 and earlier (namespaced objects in all
+    # namespaces). Use it only when stack charts need cluster-scoped objects.
+    scope: namespace
+    # ValidatingAdmissionPolicy (Kubernetes 1.30 or later) for scope
+    # namespace: the backend service account may create, change or delete
+    # Roles and RoleBindings only in namespaces with the label
+    # managed-by=k8s-stack-manager, may create only namespaces with that
+    # label, and may change or delete only namespaces whose name starts with
+    # "stack-" or that have the label. Without it, the cluster-wide RoleBinding
+    # write right could give the backend access to any namespace.
+    admissionPolicy:
+      enabled: true
 
 # ---------------------------------------------------------------------------
 # External Secrets Operator
@@ -495,6 +535,12 @@ ingress:
     middlewares:
       stripApiPrefix: false  # Backend routes include /api prefix (/api/v1/...)
       secureHeaders: true
+    # Router priority of every route of the IngressRoute. Traefik orders
+    # routers by priority, by default the length of the rule, so another
+    # Ingress on the same host with a longer rule (for example a path under
+    # /api) would win. A high value keeps the stack manager routes first.
+    # 0 = Traefik default.
+    priority: 10000
 
   # Standard Ingress settings (only used when type: ingress)
   className: ""  # e.g. "nginx", "traefik", or leave empty for cluster default

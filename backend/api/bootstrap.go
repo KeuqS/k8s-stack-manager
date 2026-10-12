@@ -181,12 +181,20 @@ func buildDomainServices(
 	// Auto-create default cluster from KUBECONFIG_PATH for single-cluster migration.
 	ensureDefaultCluster(repos.Cluster, repos.StackInstance, cfg)
 
+	// Chart repository allowlist (ALLOWED_CHART_REPOS): checked when chart
+	// configs are saved and again at deploy time.
+	models.SetAllowedChartSources(cfg.Deployment.AllowedChartRepos)
+	if len(cfg.Deployment.AllowedChartRepos) > 0 {
+		slog.Info("chart repository allowlist enabled", "prefixes", cfg.Deployment.AllowedChartRepos)
+	}
+
 	// Cluster registry for multi-cluster client management.
 	clusterRegistry := cluster.NewRegistry(cluster.RegistryOptions{
 		ClusterRepo:     repos.Cluster,
 		HelmBinary:      cfg.Deployment.HelmBinary,
 		HelmTimeout:     cfg.Deployment.DeploymentTimeout,
 		NamespaceLabels: cfg.Deployment.NamespaceLabels,
+		AccessBinding:   stackAccessBinding(cfg.Deployment.StackAccess),
 	})
 
 	// Extended health checks.
@@ -559,6 +567,7 @@ func sessionActivityFunc(repo models.RefreshTokenRepository) middleware.SessionA
 // buildRouter creates the Gin engine, wires all routes, and returns the
 // router plus the rate limiters (caller must stop them on shutdown).
 func buildRouter(cfg *config.Config, hs *handlerSet, deps routerDeps) (*gin.Engine, *routes.RateLimiters) {
+	gin.SetMode(ginMode(os.Getenv("GIN_MODE"), cfg.App.Debug))
 	router := gin.New()
 	rateLimiters := routes.SetupRoutes(router, routes.Deps{
 		Repository:                   deps.Repo,
@@ -666,6 +675,13 @@ func buildLeaderWorkers(
 			}
 		}},
 	)
+
+	// Namespace-scoped access: give stack namespaces that existed before
+	// (or lost the RoleBinding) the access RoleBinding of the backend.
+	if svc.ClusterRegistry != nil && svc.ClusterRegistry.HasAccessBinding() {
+		reconciler := cluster.NewAccessReconciler(repos.Cluster, svc.ClusterRegistry, 0)
+		group.Add(leader.Worker{Name: "stack-access-reconcile", Run: reconciler.Run})
+	}
 
 	// Ends the operations of replicas without a heartbeat. Once at the
 	// start of the term, then every minute.
@@ -838,4 +854,30 @@ func startHTTPServer(router *gin.Engine, cfg *config.Config, tel *telemetry.Tele
 	}()
 
 	return s
+}
+
+// stackAccessBinding converts the STACK_ACCESS_* config to the k8s access
+// binding; nil when namespace-scoped access is off.
+func stackAccessBinding(sa config.StackAccessConfig) *k8s.AccessBinding {
+	if !sa.Enabled() {
+		return nil
+	}
+	return &k8s.AccessBinding{
+		ClusterRole:             sa.ClusterRole,
+		ServiceAccount:          sa.ServiceAccount,
+		ServiceAccountNamespace: sa.ServiceAccountNamespace,
+	}
+}
+
+// ginMode returns the Gin mode: GIN_MODE when it is set, else release mode
+// unless APP_DEBUG is true. Debug mode prints every route at startup and
+// warnings that are not wanted in production.
+func ginMode(envMode string, debug bool) string {
+	if envMode != "" {
+		return envMode
+	}
+	if debug {
+		return gin.DebugMode
+	}
+	return gin.ReleaseMode
 }
